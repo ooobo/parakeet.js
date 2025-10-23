@@ -1,6 +1,7 @@
 import { initOrt } from './backend.js';
 import { ParakeetTokenizer } from './tokenizer.js';
 import { OnnxPreprocessor } from './preprocessor.js';
+import { calculateChunkParams, extractChunk, mergeChunkTokens, mergeChunkResults } from './chunking.js';
 
 /**
  * Lightweight Parakeet model wrapper designed for browser usage.
@@ -236,7 +237,304 @@ export class ParakeetModel {
   }
 
   /**
+   * Transcribe a single audio chunk. Internal method used by chunked processing.
+   * @private
+   */
+  async _transcribeChunk(audio, sampleRate, chunkMetadata, opts = {}) {
+    const {
+      temperature = 1.2,
+      frameStride = 1,
+      returnTimestamps = false,
+      returnConfidences = false,
+    } = opts;
+
+    // 1. Feature extraction
+    const { features, T, melBins } = await this.computeFeatures(audio, sampleRate);
+
+    // 2. Encode the chunk
+    const input = new this.ort.Tensor('float32', features, [1, melBins, T]);
+    const lenTensor = new this.ort.Tensor('int64', BigInt64Array.from([BigInt(T)]), [1]);
+    const encOut = await this.encoderSession.run({ audio_signal: input, length: lenTensor });
+    const enc = encOut['outputs'] ?? Object.values(encOut)[0];
+
+    // Transpose encoder output [B, D, T] ➔ [T, D] for B=1
+    const [, D, Tenc] = enc.dims;
+    const transposed = new Float32Array(Tenc * D);
+    for (let d = 0; d < D; d++) {
+      for (let t = 0; t < Tenc; t++) {
+        transposed[t * D + d] = enc.data[d * Tenc + t];
+      }
+    }
+
+    // 3. Decode frame-by-frame
+    const ids = [];
+    const framePositions = []; // Track which encoder frame each token came from
+    const tokenTimes = [];
+    const tokenConfs = [];
+
+    let decoderState = null;
+    let emittedTokens = 0;
+
+    for (let t = 0; t < Tenc;) {
+      const frameBuf = transposed.subarray(t * D, (t + 1) * D);
+      const encTensor = new this.ort.Tensor('float32', frameBuf, [1, D, 1]);
+
+      const prevTok = ids.length ? ids[ids.length - 1] : this.blankId;
+      const { tokenLogits, step, newState } = await this._runCombinedStep(encTensor, prevTok, decoderState);
+      decoderState = newState;
+
+      // Temperature scaling & argmax
+      let maxVal = -Infinity, maxId = 0;
+      for (let i = 0; i < tokenLogits.length; i++) {
+        const v = tokenLogits[i] / temperature;
+        if (v > maxVal) { maxVal = v; maxId = i; }
+      }
+      let sumExp = 0;
+      for (let i = 0; i < tokenLogits.length; i++) {
+        sumExp += Math.exp((tokenLogits[i] / temperature) - maxVal);
+      }
+      const confVal = 1 / sumExp;
+
+      if (maxId !== this.blankId) {
+        ids.push(maxId);
+        framePositions.push(t);
+
+        if (returnTimestamps) {
+          const TIME_STRIDE = this.subsampling * this.windowStride;
+          const durFrames = step > 0 ? step : 1;
+          const start = (chunkMetadata.chunkStart / sampleRate) + (t * TIME_STRIDE);
+          const end = (chunkMetadata.chunkStart / sampleRate) + ((t + durFrames) * TIME_STRIDE);
+          tokenTimes.push([start, end]);
+        }
+        if (returnConfidences) tokenConfs.push(confVal);
+        emittedTokens += 1;
+      }
+
+      const shouldAdvance = maxId === this.blankId || emittedTokens >= this.maxTokensPerStep;
+      t += step > 0 ? step : (shouldAdvance ? frameStride : 0);
+      if (!shouldAdvance && step === 0) t += 1;
+      if (maxId === this.blankId) emittedTokens = 0;
+    }
+
+    return {
+      tokens: ids,
+      framePositions,
+      tokenTimes,
+      tokenConfs,
+      chunkStart: chunkMetadata.chunkStart,
+      chunkEnd: chunkMetadata.chunkEnd,
+    };
+  }
+
+  /**
+   * Transcribe audio using chunked processing for large files.
+   * @private
+   */
+  async _transcribeChunked(audio, sampleRate, opts) {
+    const {
+      chunkLengthSecs,
+      bufferLengthSecs,
+      temperature = 1.2,
+      frameStride = 1,
+      returnTimestamps = false,
+      returnConfidences = false,
+      debug = false,
+    } = opts;
+
+    const perfEnabled = true;
+    const t0 = performance.now();
+
+    const audioDurationSecs = audio.length / sampleRate;
+    console.log(`[Chunked] Processing ${audioDurationSecs.toFixed(2)}s audio in chunks of ${chunkLengthSecs}s (buffer: ${bufferLengthSecs}s)`);
+
+    // Calculate chunk parameters
+    const params = calculateChunkParams(audioDurationSecs, chunkLengthSecs, bufferLengthSecs, sampleRate);
+    console.log(`[Chunked] Will process ${params.numChunks} chunks`);
+
+    // Process each chunk
+    const chunkResults = [];
+    let tPreproc = 0, tEncode = 0, tDecode = 0;
+
+    for (let i = 0; i < params.numChunks; i++) {
+      const chunkData = extractChunk(audio, i, params);
+      if (debug) {
+        console.log(`[Chunked] Processing chunk ${i + 1}/${params.numChunks} (samples ${chunkData.chunkStart}-${chunkData.chunkEnd})`);
+      }
+
+      const tChunkStart = performance.now();
+      const result = await this._transcribeChunk(chunkData.audio, sampleRate, chunkData, {
+        temperature,
+        frameStride,
+        returnTimestamps,
+        returnConfidences,
+      });
+      const tChunk = performance.now() - tChunkStart;
+
+      if (debug) {
+        console.log(`[Chunked] Chunk ${i + 1} completed in ${tChunk.toFixed(1)}ms, got ${result.tokens.length} tokens`);
+      }
+
+      chunkResults.push(result);
+
+      // Rough timing estimates (each chunk does preproc + encode + decode)
+      tPreproc += tChunk * 0.15;
+      tEncode += tChunk * 0.35;
+      tDecode += tChunk * 0.5;
+    }
+
+    // Merge tokens from all chunks
+    const tMergeStart = performance.now();
+    const mergedTokens = mergeChunkTokens(
+      chunkResults,
+      params,
+      sampleRate,
+      this.windowStride,
+      this.subsampling
+    );
+    const tMerge = performance.now() - tMergeStart;
+
+    if (debug) {
+      console.log(`[Chunked] Merged ${chunkResults.reduce((sum, r) => sum + r.tokens.length, 0)} tokens from chunks into ${mergedTokens.length} final tokens`);
+    }
+
+    // Decode tokens to text
+    const tTokenStart = performance.now();
+    const text = this._normalizer(this.tokenizer.decode(mergedTokens));
+    const tToken = performance.now() - tTokenStart;
+
+    // Build detailed output if requested
+    let words = [];
+    let tokensDetailed = [];
+    let confidenceScores = null;
+
+    if (returnTimestamps || returnConfidences) {
+      // For detailed results, we need to reconstruct from chunk data
+      const allTokenData = [];
+
+      chunkResults.forEach((result) => {
+        result.tokens.forEach((tokenId, i) => {
+          const raw = this.tokenizer.id2token[tokenId];
+          if (raw === this.tokenizer.blankToken) return;
+
+          const ts = result.tokenTimes?.[i] || [null, null];
+          const conf = result.tokenConfs?.[i];
+
+          allTokenData.push({
+            tokenId,
+            text: raw.startsWith('▁') ? raw.slice(1) : raw,
+            isWordStart: raw.startsWith('▁'),
+            startTime: ts[0],
+            endTime: ts[1],
+            confidence: conf,
+          });
+        });
+      });
+
+      // Build words from tokens
+      let currentWord = '';
+      let wordStart = 0;
+      let wordEnd = 0;
+      let wordConfs = [];
+
+      allTokenData.forEach((tok) => {
+        if (tok.isWordStart) {
+          if (currentWord) {
+            const avg = wordConfs.length ? wordConfs.reduce((a, b) => a + b, 0) / wordConfs.length : 0;
+            words.push({
+              text: currentWord,
+              start_time: +wordStart.toFixed(3),
+              end_time: +wordEnd.toFixed(3),
+              confidence: +avg.toFixed(4),
+            });
+          }
+          currentWord = tok.text;
+          wordStart = tok.startTime || 0;
+          wordEnd = tok.endTime || 0;
+          wordConfs = tok.confidence !== undefined ? [tok.confidence] : [];
+        } else {
+          currentWord += tok.text;
+          wordEnd = tok.endTime || wordEnd;
+          if (tok.confidence !== undefined) wordConfs.push(tok.confidence);
+        }
+
+        // Add to detailed tokens
+        const tokEntry = { token: [tok.text] };
+        if (returnTimestamps && tok.startTime !== null) {
+          tokEntry.start_time = +tok.startTime.toFixed(3);
+          tokEntry.end_time = +tok.endTime.toFixed(3);
+        }
+        if (returnConfidences && tok.confidence !== undefined) {
+          tokEntry.confidence = +tok.confidence.toFixed(4);
+        }
+        tokensDetailed.push(tokEntry);
+      });
+
+      // Add last word
+      if (currentWord) {
+        const avg = wordConfs.length ? wordConfs.reduce((a, b) => a + b, 0) / wordConfs.length : 0;
+        words.push({
+          text: currentWord,
+          start_time: +wordStart.toFixed(3),
+          end_time: +wordEnd.toFixed(3),
+          confidence: +avg.toFixed(4),
+        });
+      }
+
+      // Calculate average confidences
+      if (returnConfidences) {
+        const tokenConfValues = tokensDetailed.map(t => t.confidence).filter(c => c !== undefined);
+        const wordConfValues = words.map(w => w.confidence).filter(c => c !== undefined);
+
+        confidenceScores = {
+          token_avg: tokenConfValues.length ? +(tokenConfValues.reduce((a, b) => a + b, 0) / tokenConfValues.length).toFixed(4) : null,
+          word_avg: wordConfValues.length ? +(wordConfValues.reduce((a, b) => a + b, 0) / wordConfValues.length).toFixed(4) : null,
+        };
+      }
+    }
+
+    const total = performance.now() - t0;
+    const rtf = audioDurationSecs / (total / 1000);
+
+    if (perfEnabled) {
+      console.log(`[Chunked Perf] RTF: ${rtf.toFixed(2)}x (audio ${audioDurationSecs.toFixed(2)} s, time ${(total / 1000).toFixed(2)} s)`);
+      console.table({
+        Preprocess: `${tPreproc.toFixed(1)} ms`,
+        Encode: `${tEncode.toFixed(1)} ms`,
+        Decode: `${tDecode.toFixed(1)} ms`,
+        Merge: `${tMerge.toFixed(1)} ms`,
+        Tokenize: `${tToken.toFixed(1)} ms`,
+        Total: `${total.toFixed(1)} ms`,
+      });
+    }
+
+    return {
+      utterance_text: text,
+      words,
+      tokens: tokensDetailed,
+      confidence_scores: confidenceScores || { overall_log_prob: null, frame: null, frame_avg: null },
+      metrics: {
+        preprocess_ms: +tPreproc.toFixed(1),
+        encode_ms: +tEncode.toFixed(1),
+        decode_ms: +tDecode.toFixed(1),
+        merge_ms: +tMerge.toFixed(1),
+        tokenize_ms: +tToken.toFixed(1),
+        total_ms: +total.toFixed(1),
+        rtf: +rtf.toFixed(2),
+        num_chunks: params.numChunks,
+      },
+      is_final: true,
+    };
+  }
+
+  /**
    * Transcribe 16-kHz mono PCM. Returns full rich output (timestamps/confidences opt-in).
+   *
+   * For large audio files, use chunking to reduce memory usage:
+   * @param {Float32Array} audio - PCM audio samples
+   * @param {number} sampleRate - Sample rate (default 16000)
+   * @param {Object} opts - Options
+   * @param {number} opts.chunkLengthSecs - Enable chunking with this chunk size (e.g., 10)
+   * @param {number} opts.bufferLengthSecs - Total buffer size including padding (e.g., 15)
    */
   async transcribe(audio, sampleRate = 16000, opts = {}) {
     const {
@@ -246,7 +544,18 @@ export class ParakeetModel {
       debug = false,
       skipCMVN = false,
       frameStride = 1,
+      chunkLengthSecs = null,
+      bufferLengthSecs = null,
     } = opts;
+
+    // If chunking is requested, use chunked processing
+    if (chunkLengthSecs !== null && chunkLengthSecs > 0) {
+      return this._transcribeChunked(audio, sampleRate, {
+        ...opts,
+        chunkLengthSecs,
+        bufferLengthSecs: bufferLengthSecs || chunkLengthSecs * 1.5, // Default: 50% padding
+      });
+    }
 
     const perfEnabled = true; // always collect and log timings
     let t0, tPreproc = 0, tEncode = 0, tDecode = 0, tToken = 0;

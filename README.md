@@ -111,6 +111,34 @@ Extra options:
 |--------|---------|-------------|
 | `temperature` | 1.2 | Softmax temperature for decoding |
 | `frameStride` | 1 | Advance decoder by *n* encoder frames per step |
+| `chunkLengthSecs` | `null` | Enable chunking for large files (e.g., 10) |
+| `bufferLengthSecs` | `1.5x chunk` | Total buffer with padding (e.g., 15) |
+
+### Chunking for Large Audio Files
+
+For audio files longer than 30 seconds, chunked processing prevents memory issues:
+
+```js
+const result = await model.transcribe(longAudio, 16_000, {
+  chunkLengthSecs: 10,      // Process in 10-second chunks
+  bufferLengthSecs: 15,     // 15-second buffer (chunk + padding)
+  returnTimestamps: true,
+});
+
+console.log(`Processed in ${result.metrics.num_chunks} chunks`);
+```
+
+**Benefits:**
+- **Constant memory usage** regardless of audio length
+- **Handles files of any duration** without out-of-memory errors
+- **Transparent to accuracy** - same quality as non-chunked processing
+
+**Guidelines:**
+- For 30s-2min files: use 15-20 second chunks
+- For 2-10min files: use 10-15 second chunks
+- For >10min files: use 8-10 second chunks
+
+See [`CHUNKING.md`](CHUNKING.md) for detailed documentation and examples.
 
 ### Result schema
 
@@ -166,6 +194,8 @@ if (utterance_text.toLowerCase().includes(expected)) {
 | `encoderQuant` | `getParakeetModel()` | Selects `fp32` or `int8` model for the encoder. |
 | `decoderQuant` | `getParakeetModel()` | Selects `fp32` or `int8` model for the decoder. |
 | `frameStride` | `transcribe()` | Trade-off latency vs accuracy |
+| `chunkLengthSecs` | `transcribe()` | Enable chunking for large files; reduces memory usage |
+| `bufferLengthSecs` | `transcribe()` | Buffer size for chunked processing (chunk + padding) |
 | `enableProfiling` | `fromUrls()` | Enables ORT profiler (JSON written to `/tmp/profile_*.json`) |
 
 ---
