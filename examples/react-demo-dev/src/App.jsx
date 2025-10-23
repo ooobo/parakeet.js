@@ -21,6 +21,9 @@ export default function App() {
   const [dumpDetail, setDumpDetail] = useState(false);
   const maxCores = navigator.hardwareConcurrency || 8;
   const [cpuThreads, setCpuThreads] = useState(Math.max(1, maxCores - 2));
+  const [enableChunking, setEnableChunking] = useState(false);
+  const [chunkLengthSecs, setChunkLengthSecs] = useState(10);
+  const [bufferLengthSecs, setBufferLengthSecs] = useState(15);
   const modelRef = useRef(null);
   const fileInputRef = useRef(null);
 
@@ -127,10 +130,20 @@ export default function App() {
       const pcm = decoded.getChannelData(0);
 
       console.time(`Transcribe-${file.name}`);
-      const res = await modelRef.current.transcribe(pcm, 16_000, { 
-        returnTimestamps: true, 
-        returnConfidences: true , frameStride
-      });
+      const opts = {
+        returnTimestamps: true,
+        returnConfidences: true,
+        frameStride
+      };
+
+      // Add chunking parameters if enabled
+      if (enableChunking) {
+        opts.chunkLengthSecs = chunkLengthSecs;
+        opts.bufferLengthSecs = bufferLengthSecs;
+        opts.debug = true; // Enable debug logging for chunking
+      }
+
+      const res = await modelRef.current.transcribe(pcm, 16_000, opts);
       console.timeEnd(`Transcribe-${file.name}`);
 
       if (dumpDetail) {
@@ -173,7 +186,7 @@ export default function App() {
 
   return (
     <div className="app">
-      <h2>Parakeet JS React Demo - Using npm package</h2>
+      <h2>Parakeet JS React Demo - Dev Version with Chunking 🎯</h2>
 
       <div className="controls">
         <p>
@@ -237,13 +250,73 @@ export default function App() {
             <input type="number" min="1" max={maxCores} value={cpuThreads} onChange={e=>setCpuThreads(Number(e.target.value))} style={{width:'4rem'}} />
           </label>
         )}
-        <button 
-          onClick={loadModel} 
+        <button
+          onClick={loadModel}
           disabled={!status.toLowerCase().includes('fail') && status !== 'Idle'}
           className="primary"
         >
           {status === 'Model ready ✔' ? 'Model Loaded' : 'Load Model'}
         </button>
+      </div>
+
+      {/* Chunking controls */}
+      <div className="controls" style={{
+        padding: '0.75rem',
+        backgroundColor: '#f0f8ff',
+        border: '2px solid #4a9eff',
+        borderRadius: '6px',
+        marginTop: '0.5rem'
+      }}>
+        <div style={{ marginBottom: '0.5rem' }}>
+          <strong>🎯 Audio Chunking (for large files):</strong>
+        </div>
+        <label style={{ display: 'inline-flex', alignItems: 'center', marginRight: '1rem' }}>
+          <input
+            type="checkbox"
+            checked={enableChunking}
+            onChange={e => setEnableChunking(e.target.checked)}
+            disabled={isTranscribing}
+          />
+          <span style={{ marginLeft: '0.3rem' }}>Enable Chunking</span>
+        </label>
+        {enableChunking && (
+          <>
+            <label style={{ marginRight: '1rem' }}>
+              Chunk Size:
+              <input
+                type="number"
+                min="5"
+                max="30"
+                step="1"
+                value={chunkLengthSecs}
+                onChange={e => setChunkLengthSecs(Number(e.target.value))}
+                disabled={isTranscribing}
+                style={{ width: '4rem', marginLeft: '0.3rem' }}
+              />
+              s
+            </label>
+            <label>
+              Buffer Size:
+              <input
+                type="number"
+                min={chunkLengthSecs + 1}
+                max="40"
+                step="1"
+                value={bufferLengthSecs}
+                onChange={e => setBufferLengthSecs(Number(e.target.value))}
+                disabled={isTranscribing}
+                style={{ width: '4rem', marginLeft: '0.3rem' }}
+              />
+              s
+            </label>
+          </>
+        )}
+        <div style={{ fontSize: '0.85em', marginTop: '0.5rem', color: '#555' }}>
+          {enableChunking
+            ? `✓ Will process audio in ${chunkLengthSecs}s chunks with ${bufferLengthSecs}s buffer (reduces memory usage)`
+            : '⚠️ Disabled: Large files (>30s) may cause memory issues'
+          }
+        </div>
       </div>
 
       {typeof SharedArrayBuffer === 'undefined' && backend === 'wasm' && (
@@ -301,8 +374,12 @@ export default function App() {
       {/* Latest transcription performace info */}
       {latestMetrics && (
         <div className="performance">
-          <strong>RTF:</strong> {latestMetrics.rtf?.toFixed(2)}x &nbsp;|&nbsp; Total: {latestMetrics.total_ms} ms<br/>
-          Preprocess {latestMetrics.preprocess_ms} ms · Encode {latestMetrics.encode_ms} ms · Decode {latestMetrics.decode_ms} ms · Tokenize {latestMetrics.tokenize_ms} ms
+          <strong>RTF:</strong> {latestMetrics.rtf?.toFixed(2)}x &nbsp;|&nbsp; Total: {latestMetrics.total_ms} ms
+          {latestMetrics.num_chunks && <>&nbsp;|&nbsp; <strong>Chunks:</strong> {latestMetrics.num_chunks}</>}
+          <br/>
+          Preprocess {latestMetrics.preprocess_ms} ms · Encode {latestMetrics.encode_ms} ms · Decode {latestMetrics.decode_ms} ms
+          {latestMetrics.merge_ms && <> · Merge {latestMetrics.merge_ms} ms</>}
+          {' '}· Tokenize {latestMetrics.tokenize_ms} ms
         </div>
       )}
 
