@@ -239,6 +239,25 @@ This demo showcases:
 
 The demo is also available locally at `examples/hf-spaces-demo` and can be deployed to your own HF Space.
 
+### 📦 Deploy Your Own Demo to GitHub Pages
+
+Want to test chunking or customize the demo? Deploy it to GitHub Pages:
+
+```bash
+# Enable GitHub Pages in Settings → Pages → Source: GitHub Actions
+# Push to main/master or manually trigger the workflow
+```
+
+Your demo will be live at: `https://<username>.github.io/parakeet.js/`
+
+**Features in the deployed demo:**
+- 🎯 **Chunking controls** - Toggle chunking on/off and adjust chunk sizes
+- 📊 **Real-time comparison** - Compare chunked vs non-chunked transcription
+- 💾 **Model caching** - IndexedDB caching for faster subsequent loads
+- 📈 **Performance metrics** - RTF, memory usage, processing times
+
+See [`GITHUB_PAGES_DEPLOYMENT.md`](GITHUB_PAGES_DEPLOYMENT.md) for complete setup instructions and testing guide.
+
 ---
 
 ## Troubleshooting
