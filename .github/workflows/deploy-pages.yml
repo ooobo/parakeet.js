@@ -16,9 +16,6 @@ concurrency:
 
 jobs:
   deploy:
-    environment:
-      name: github-pages
-      url: https://ooobo.github.io/parakeet.js/
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
